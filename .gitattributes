@@ -1,0 +1,7 @@
+* filter=git-crypt diff=git-crypt
+
+# GitHub must read the workflow before checkout can unlock the repository.
+# These two control surfaces contain no account data or secrets.
+.gitattributes !filter !diff
+.github/workflows/*.yml !filter !diff
+.github/workflows/*.yaml !filter !diff
