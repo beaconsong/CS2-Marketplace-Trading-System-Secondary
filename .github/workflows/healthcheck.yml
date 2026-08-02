@@ -1,0 +1,97 @@
+name: CSFloat Secondary Health Check
+
+on:
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  healthcheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository code
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install git-crypt
+        run: sudo apt-get install -y git-crypt
+
+      - name: Unlock git-crypt
+        env:
+          GIT_CRYPT_KEY: ${{ secrets.GIT_CRYPT_KEY }}
+        run: |
+          printf '%s' "$GIT_CRYPT_KEY" | base64 -d > git-crypt-key
+          git-crypt unlock git-crypt-key
+          rm git-crypt-key
+
+      - name: Install health-check dependency
+        run: python -m pip install requests
+
+      - name: Verify configuration, CSFloat API, and Discord
+        env:
+          CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python <<'PY'
+          import os
+          import runpy
+
+          import requests
+
+          items = []
+          for path in (
+              "config/listings_hot.py",
+              "config/listings_mid.py",
+              "config/listings.py",
+          ):
+              items.extend(runpy.run_path(path)["TRACKED_ITEMS"])
+          if len(items) != 150:
+              raise SystemExit(f"Expected 150 active listings, found {len(items)}")
+
+          headers = {"Authorization": os.environ["CSFLOAT_API_KEY"]}
+          profile = requests.get(
+              "https://csfloat.com/api/v1/me",
+              headers=headers,
+              timeout=20,
+          )
+          profile.raise_for_status()
+          profile_data = profile.json()
+          balance_cents = profile_data.get("balance")
+          if not isinstance(balance_cents, (int, float)):
+              raise SystemExit("CSFloat profile response did not contain a numeric balance")
+
+          orders = requests.get(
+              "https://csfloat.com/api/v1/me/buy-orders",
+              headers=headers,
+              params={"limit": 1},
+              timeout=20,
+          )
+          orders.raise_for_status()
+
+          balance = float(balance_cents) / 100
+          message = (
+              "✅ Bot B read-only production health check passed: "
+              "configuration loaded, CSFloat authenticated, and Discord is reachable."
+          )
+          webhook = requests.post(
+              os.environ["DISCORD_WEBHOOK_URL"],
+              json={"content": message},
+              timeout=20,
+          )
+          webhook.raise_for_status()
+          print(f"Configured listings: {len(items)}")
+          print(f"CSFloat balance: ${balance:.2f}")
+          print("Buy-order endpoint: authenticated read succeeded")
+          print("Discord webhook: test message delivered")
+          PY
