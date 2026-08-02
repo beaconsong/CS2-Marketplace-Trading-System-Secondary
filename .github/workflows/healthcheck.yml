@@ -67,8 +67,22 @@ jobs:
           )
           profile.raise_for_status()
           profile_data = profile.json()
-          balance_cents = profile_data.get("balance")
-          if not isinstance(balance_cents, (int, float)):
+          def find_balance(value):
+              if isinstance(value, dict):
+                  for key, nested in value.items():
+                      if str(key).lower() == "balance":
+                          try:
+                              return float(nested)
+                          except (TypeError, ValueError):
+                              pass
+                  for nested in value.values():
+                      found = find_balance(nested)
+                      if found is not None:
+                          return found
+              return None
+
+          balance_cents = find_balance(profile_data)
+          if balance_cents is None:
               raise SystemExit("CSFloat profile response did not contain a numeric balance")
 
           orders = requests.get(
@@ -79,7 +93,7 @@ jobs:
           )
           orders.raise_for_status()
 
-          balance = float(balance_cents) / 100
+          balance = balance_cents / 100
           message = (
               "✅ Bot B read-only production health check passed: "
               "configuration loaded, CSFloat authenticated, and Discord is reachable."
