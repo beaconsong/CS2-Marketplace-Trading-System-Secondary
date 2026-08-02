@@ -1,3 +1,4 @@
+# Bot B is manual-dispatch only until the operator explicitly enables it.
 name: CSFloat Secondary Monitor
 on:
   workflow_dispatch:
