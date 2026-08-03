@@ -1,7 +1,9 @@
 * filter=git-crypt diff=git-crypt
 
 # GitHub must read the workflow before checkout can unlock the repository.
-# These two control surfaces contain no account data or secrets.
+# These control surfaces contain no account data or secrets. The log sender
+# must remain executable even when git-crypt unlock itself is the failed step.
 .gitattributes !filter !diff
 .github/workflows/*.yml !filter !diff
 .github/workflows/*.yaml !filter !diff
+.github/scripts/send_private_log.py !filter !diff

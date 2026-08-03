@@ -5,120 +5,212 @@ on:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GIT_TERMINAL_PROMPT: "0"
 
 jobs:
   healthcheck:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 50
     permissions:
       contents: write
     steps:
       - name: Checkout repository code
+        timeout-minutes: 5
         uses: actions/checkout@v4
         with:
           ref: master
           fetch-depth: 1
 
       - name: Set up Python
+        timeout-minutes: 5
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: pip
 
       - name: Install git-crypt
+        timeout-minutes: 5
         run: sudo apt-get install -y git-crypt
 
       - name: Unlock git-crypt
+        timeout-minutes: 3
         env:
           GIT_CRYPT_KEY: ${{ secrets.GIT_CRYPT_KEY }}
         run: |
+          umask 077
+          trap 'rm -f git-crypt-key' EXIT
           printf '%s' "$GIT_CRYPT_KEY" | base64 -d > git-crypt-key
           git-crypt unlock git-crypt-key
-          rm git-crypt-key
+
+      - name: Install health-check dependencies
+        timeout-minutes: 7
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Validate decrypted runtime configuration
+        timeout-minutes: 5
+        run: |
+          if ! python .github/scripts/validate_runtime_config.py > /tmp/healthcheck_validation.txt 2>&1; then
+            echo "::error title=Runtime configuration invalid::Detailed decrypted diagnostics were withheld from Actions output."
+            exit 1
+          fi
 
       - name: Verify runtime checkpoint permission
+        timeout-minutes: 5
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit --allow-empty -m "health-check permission probe"
-          git push --dry-run origin HEAD:master
+          timeout --signal=TERM --kill-after=5s 90s git push --dry-run origin HEAD:master
 
-      - name: Install health-check dependency
-        run: python -m pip install requests
-
-      - name: Verify configuration, CSFloat API, and Discord
+      - name: Verify CSFloat API and Discord
+        timeout-minutes: 5
         env:
           CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_LOG_WEBHOOK_URL: ${{ secrets.DISCORD_LOG_WEBHOOK_URL }}
         run: |
           python <<'PY'
+          import math
           import os
-          import runpy
 
           import requests
 
-          items = []
-          for path in (
-              "config/listings_hot.py",
-              "config/listings_mid.py",
-              "config/listings.py",
-          ):
-              items.extend(runpy.run_path(path)["TRACKED_ITEMS"])
-          if len(items) != 150:
-              raise SystemExit(f"Expected 150 active listings, found {len(items)}")
 
-          headers = {"Authorization": os.environ["CSFLOAT_API_KEY"]}
-          profile = requests.get(
-              "https://csfloat.com/api/v1/me",
-              headers=headers,
-              timeout=20,
-          )
-          profile.raise_for_status()
-          profile_data = profile.json()
+          def safe_request(label, method, url, **kwargs):
+              try:
+                  response = requests.request(
+                      method,
+                      url,
+                      timeout=20,
+                      allow_redirects=False,
+                      **kwargs,
+                  )
+              except requests.RequestException as exc:
+                  raise SystemExit(
+                      f"{label} transport failed ({type(exc).__name__})"
+                  ) from None
+              if response.status_code < 200 or response.status_code >= 300:
+                  raise SystemExit(f"{label} returned HTTP {response.status_code}")
+              return response
+
+
           def find_balance(value):
               if isinstance(value, dict):
                   for key, nested in value.items():
                       if str(key).lower() == "balance":
+                          if isinstance(nested, bool):
+                              continue
                           try:
-                              return float(nested)
-                          except (TypeError, ValueError):
-                              pass
+                              balance = float(nested)
+                          except (TypeError, ValueError, OverflowError):
+                              continue
+                          if math.isfinite(balance) and balance >= 0:
+                              return balance
                   for nested in value.values():
                       found = find_balance(nested)
                       if found is not None:
                           return found
               return None
 
+
+          api_key = os.environ.get("CSFLOAT_API_KEY", "").strip()
+          webhooks = {
+              value.strip()
+              for value in (
+                  os.environ.get("DISCORD_WEBHOOK_URL", ""),
+                  os.environ.get("DISCORD_LOG_WEBHOOK_URL", ""),
+              )
+              if value.strip()
+          }
+          if not api_key or not webhooks:
+              raise SystemExit("Required health-check secrets are missing")
+
+          headers = {"Authorization": api_key}
+          profile = safe_request(
+              "CSFloat profile",
+              "GET",
+              "https://csfloat.com/api/v1/me",
+              headers=headers,
+          )
+          try:
+              profile_data = profile.json()
+          except ValueError:
+              raise SystemExit("CSFloat profile returned malformed JSON") from None
           balance_cents = find_balance(profile_data)
           if balance_cents is None:
-              raise SystemExit("CSFloat profile response did not contain a numeric balance")
+              raise SystemExit("CSFloat profile did not contain a valid balance")
 
-          orders = requests.get(
+          orders = safe_request(
+              "CSFloat buy-order read",
+              "GET",
               "https://csfloat.com/api/v1/me/buy-orders",
               headers=headers,
               params={"limit": 1},
-              timeout=20,
           )
-          orders.raise_for_status()
+          try:
+              order_payload = orders.json()
+          except ValueError:
+              raise SystemExit("CSFloat buy-order endpoint returned malformed JSON") from None
+          if not isinstance(order_payload, dict) or not isinstance(
+              order_payload.get("orders"), list
+          ):
+              raise SystemExit("CSFloat buy-order endpoint returned an unexpected shape")
 
-          balance = balance_cents / 100
           message = (
-              "✅ Bot B read-only production health check passed: "
-              "configuration loaded, CSFloat authenticated, and Discord is reachable."
+              "✅ Bot B read-only production health check passed: strict "
+              "configuration validation, CSFloat authentication, and Discord delivery."
           )
-          webhook_urls = {
-              os.environ["DISCORD_WEBHOOK_URL"],
-              os.environ["DISCORD_LOG_WEBHOOK_URL"],
-          }
-          for webhook_url in webhook_urls:
-              webhook = requests.post(
+          for webhook_url in webhooks:
+              response = safe_request(
+                  "Discord health check",
+                  "POST",
                   webhook_url,
-                  json={"content": message},
-                  timeout=20,
+                  json={"content": message, "allowed_mentions": {"parse": []}},
               )
-              webhook.raise_for_status()
-          print(f"Configured listings: {len(items)}")
-          print(f"CSFloat balance: ${balance:.2f}")
-          print("Buy-order endpoint: authenticated read succeeded")
-          print(f"Discord webhook: delivered to {len(webhook_urls)} unique endpoint(s)")
+              if response.status_code not in (200, 204):
+                  raise SystemExit(
+                      f"Discord health check returned HTTP {response.status_code}"
+                  )
+
+          print("Read-only production health checks passed; account details were not logged")
+          PY
+
+      - name: Report health-check failure to Discord
+        if: ${{ failure() }}
+        timeout-minutes: 3
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_LOG_WEBHOOK_URL: ${{ secrets.DISCORD_LOG_WEBHOOK_URL }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from urllib.request import Request, urlopen
+
+          webhook = (
+              os.environ.get("DISCORD_LOG_WEBHOOK_URL", "").strip()
+              or os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+          )
+          if not webhook:
+              raise SystemExit("Health-check failure webhook is unavailable")
+          payload = json.dumps({
+              "content": (
+                  "🛑 Bot B read-only production health check failed. "
+                  f"Run: {os.environ.get('RUN_URL', 'unavailable')}"
+              ),
+              "allowed_mentions": {"parse": []},
+          }).encode("utf-8")
+          request = Request(
+              webhook,
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urlopen(request, timeout=20) as response:
+                  if response.status not in (200, 204):
+                      raise RuntimeError("unexpected response")
+          except Exception:
+              raise SystemExit("Discord failure report could not be delivered") from None
           PY

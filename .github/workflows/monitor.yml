@@ -13,21 +13,27 @@ on:
           - hot
           - mid
           - cold
+
 concurrency:
   group: csfloat-secondary-monitor-production
   cancel-in-progress: false
+
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GIT_TERMINAL_PROMPT: "0"
+  RUNTIME_PRIVATE_LOG: /tmp/bot_output.txt
+
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 100
+    timeout-minutes: 150
     permissions:
       contents: write
       actions: read
     steps:
       - name: Check dispatch freshness
         id: admission
+        timeout-minutes: 3
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -54,41 +60,69 @@ jobs:
               );
             }
 
-      - name: Checkout repository code
+      - name: Initialize private run log
+        id: initialize_log
         if: steps.admission.outputs.should_run == 'true'
+        run: |
+          : > "$RUNTIME_PRIVATE_LOG"
+          printf '[WORKFLOW] admission=%s\n' '${{ steps.admission.outcome }}' >> "$RUNTIME_PRIVATE_LOG"
+
+      - name: Checkout repository code
+        id: checkout
+        if: steps.admission.outputs.should_run == 'true'
+        timeout-minutes: 5
         uses: actions/checkout@v4
         with:
-          # workflow_dispatch captures a SHA when cron submits the run. A
-          # queued run may start after the previous serialized run has pushed
-          # newer encrypted state, so always begin from the live branch head.
+          # A queued dispatch can start after an earlier serialized run has
+          # checkpointed newer encrypted state. Always begin at live master.
           ref: master
           fetch-depth: 0
-      
+
       - name: Set up Python
+        id: setup_python
         if: steps.admission.outputs.should_run == 'true'
+        timeout-minutes: 5
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
-          cache: 'pip'
-      
+          python-version: "3.10"
+          cache: pip
+
       - name: Install git-crypt
+        id: install_git_crypt
         if: steps.admission.outputs.should_run == 'true'
+        timeout-minutes: 5
         run: sudo apt-get install -y git-crypt
 
       - name: Unlock git-crypt
+        id: unlock
         if: steps.admission.outputs.should_run == 'true'
+        timeout-minutes: 3
+        env:
+          GIT_CRYPT_KEY: ${{ secrets.GIT_CRYPT_KEY }}
         run: |
-          echo "${{ secrets.GIT_CRYPT_KEY }}" | base64 -d > git-crypt-key
+          umask 077
+          trap 'rm -f git-crypt-key' EXIT
+          printf '%s' "$GIT_CRYPT_KEY" | base64 -d > git-crypt-key
           git-crypt unlock git-crypt-key
-          rm git-crypt-key
 
       - name: Install dependencies
+        id: dependencies
         if: steps.admission.outputs.should_run == 'true'
+        timeout-minutes: 7
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Validate decrypted runtime configuration
+        id: validate
+        if: steps.admission.outputs.should_run == 'true'
+        timeout-minutes: 5
         run: |
-          python -m pip install --upgrade pip
-          pip install requests python-dotenv
+          if ! python .github/scripts/validate_runtime_config.py >> "$RUNTIME_PRIVATE_LOG" 2>&1; then
+            echo "::error title=Runtime configuration invalid::Detailed diagnostics were kept out of Actions logs and sent to the private run-log webhook."
+            exit 1
+          fi
 
       - name: Run the monitor script
+        id: monitor
         if: steps.admission.outputs.should_run == 'true'
         timeout-minutes: 85
         env:
@@ -97,68 +131,67 @@ jobs:
           LISTING_TIER: ${{ github.event.inputs.listing_tier || 'cycle' }}
         run: |
           echo "Running monitor. Detailed bot output is saved privately and sent to Discord."
-          PYTHONIOENCODING=utf-8 python main.py > /tmp/bot_output.txt 2>&1
+          PYTHONUNBUFFERED=1 PYTHONIOENCODING=utf-8 python main.py >> "$RUNTIME_PRIVATE_LOG" 2>&1
 
       - name: Checkpoint runtime changes
-        if: ${{ always() && steps.admission.outputs.should_run == 'true' }}
+        id: checkpoint
+        if: ${{ steps.monitor.outcome == 'success' }}
+        timeout-minutes: 10
         run: bash .github/scripts/checkpoint_runtime.sh
 
       - name: Send logs to Discord
-        if: ${{ always() && steps.admission.outputs.should_run == 'true' }}
-        continue-on-error: true
+        if: ${{ always() && steps.checkout.outcome == 'success' }}
+        timeout-minutes: 10
         env:
+          CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_LOG_WEBHOOK_URL: ${{ secrets.DISCORD_LOG_WEBHOOK_URL }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          ADMISSION_OUTCOME: ${{ steps.admission.outcome }}
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+          UNLOCK_OUTCOME: ${{ steps.unlock.outcome }}
+          VALIDATION_OUTCOME: ${{ steps.validate.outcome }}
+          MONITOR_OUTCOME: ${{ steps.monitor.outcome }}
+          CHECKPOINT_OUTCOME: ${{ steps.checkpoint.outcome }}
+          JOB_STATUS: ${{ job.status }}
+        run: python .github/scripts/send_private_log.py
+
+      - name: Report admission or checkout failure to Discord
+        if: ${{ always() && (steps.admission.outcome == 'failure' || steps.admission.outcome == 'cancelled' || (steps.admission.outputs.should_run == 'true' && steps.checkout.outcome != 'success')) }}
+        timeout-minutes: 3
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_LOG_WEBHOOK_URL: ${{ secrets.DISCORD_LOG_WEBHOOK_URL }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python << 'EOF'
-          import requests
-          import time
+          python - <<'PY'
+          import json
           import os
+          from urllib.request import Request, urlopen
 
-          webhook = os.environ["DISCORD_LOG_WEBHOOK_URL"]
-
-          with open("/tmp/bot_output.txt", "r", encoding="utf-8", errors="replace") as f:
-              log = f.read()
-
-          if not log.strip():
-              log = "(no output)"
-
-          chunks = [log[i:i+1800] for i in range(0, len(log), 1800)]
-          total = len(chunks)
-
-          for i, chunk in enumerate(chunks):
-              msg = f"**📋 Bot Log [{i+1}/{total}]**\n```\n{chunk}\n```"
-              
-              sent = False
-              for attempt in range(7):
-                  try:
-                      r = requests.post(webhook, json={"content": msg}, timeout=15)
-                      
-                      if r.status_code in [200, 204]:
-                          sent = True
-                          break
-                      elif r.status_code == 429:
-                          data = r.json()
-                          retry_after = data.get("retry_after", 10)
-                          is_global = data.get("global", False)
-                          wait = retry_after + 3
-                          if is_global:
-                              wait = max(wait, 30)
-                          print(f"Rate limited (global={is_global}), waiting {wait}s (attempt {attempt+1}/7)...")
-                          time.sleep(wait)
-                      else:
-                          print(f"Failed with {r.status_code}, waiting 10s before retry...")
-                          time.sleep(10)
-                  except Exception as e:
-                      print(f"Request error: {e}, waiting 15s...")
-                      time.sleep(15)
-
-              if not sent:
-                  print(f"Chunk {i+1} failed after all retries — skipping")
-
-              if (i + 1) % 5 == 0:
-                  print("Burst pause — waiting 30s...")
-                  time.sleep(30)
-              else:
-                  time.sleep(5)
-
-          EOF
+          webhook = (
+              os.environ.get("DISCORD_LOG_WEBHOOK_URL", "").strip()
+              or os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+          )
+          if not webhook:
+              raise SystemExit("Generic failure webhook is unavailable")
+          payload = json.dumps({
+              "content": (
+                  "🛑 Monitor workflow failed before the private reporter was available. "
+                  f"Run: {os.environ.get('RUN_URL', 'unavailable')}"
+              ),
+              "allowed_mentions": {"parse": []},
+          }).encode("utf-8")
+          request = Request(
+              webhook,
+              data=payload,
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              with urlopen(request, timeout=20) as response:
+                  if response.status not in (200, 204):
+                      raise RuntimeError("unexpected response")
+          except Exception:
+              raise SystemExit("Generic Discord failure report could not be delivered") from None
+          PY
