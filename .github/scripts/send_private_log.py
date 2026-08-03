@@ -110,6 +110,12 @@ def main() -> int:
                 if status_code in (200, 204):
                     sent = True
                     break
+                if 400 <= status_code < 500 and status_code != 429:
+                    print(
+                        f"Discord HTTP {status_code}; private log endpoint "
+                        f"rejected chunk {index + 1}"
+                    )
+                    break
             except urllib.error.HTTPError as exc:
                 if exc.code == 429:
                     try:
@@ -118,6 +124,12 @@ def main() -> int:
                     except (ValueError, TypeError, json.JSONDecodeError):
                         retry_after = 2
                     wait = min(60, max(1, retry_after + 1))
+                elif 400 <= exc.code < 500:
+                    print(
+                        f"Discord HTTP {exc.code}; private log endpoint "
+                        f"rejected chunk {index + 1}"
+                    )
+                    break
                 print(
                     f"Discord HTTP {exc.code}; retrying chunk {index + 1} "
                     f"in {wait}s ({attempt + 1}/5)"
@@ -131,11 +143,16 @@ def main() -> int:
                 time.sleep(wait)
         if not sent:
             failed_chunks += 1
-            print(f"Chunk {index + 1} failed after all retries")
+            print(f"Chunk {index + 1} was not delivered")
         if index + 1 < len(chunks):
             time.sleep(1)
 
     if failed_chunks:
+        print(
+            "::warning title=Private Discord log unavailable::"
+            "The monitor result is authoritative; update the dedicated "
+            "DISCORD_LOG_WEBHOOK_URL secret to restore private log delivery."
+        )
         raise SystemExit(
             f"Discord delivery failed for {failed_chunks}/{len(chunks)} chunks"
         )

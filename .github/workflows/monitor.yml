@@ -141,6 +141,9 @@ jobs:
 
       - name: Send logs to Discord
         if: ${{ always() && steps.checkout.outcome == 'success' }}
+        # Observability must not rewrite a successful monitor/checkpoint result.
+        # The helper still exits nonzero and emits a warning when delivery fails.
+        continue-on-error: true
         timeout-minutes: 10
         env:
           CSFLOAT_API_KEY: ${{ secrets.CSFLOAT_API_KEY }}
