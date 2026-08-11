@@ -3,13 +3,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
+
+import requests
 
 
 def redact_secrets(value: str, environment: dict[str, str] | None = None) -> str:
@@ -96,45 +95,37 @@ def main() -> int:
         for attempt in range(5):
             wait = min(15, 2**attempt)
             try:
-                payload = json.dumps(
-                    {"content": message, "allowed_mentions": {"parse": []}}
-                ).encode("utf-8")
-                request = urllib.request.Request(
+                # Keep the requests transport that delivered this webhook before
+                # the private-log hardening change. Discord returns 403 to the
+                # runner's default Python-urllib user agent, while the same
+                # existing webhook accepts requests' established client profile.
+                response = requests.post(
                     webhook,
-                    data=payload,
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
+                    json={"content": message, "allowed_mentions": {"parse": []}},
+                    timeout=15,
                 )
-                with urllib.request.urlopen(request, timeout=15) as response:
-                    status_code = response.status
+                status_code = response.status_code
                 if status_code in (200, 204):
                     sent = True
                     break
+                if status_code == 429:
+                    try:
+                        body = response.json()
+                        retry_after = float(body.get("retry_after", 2))
+                    except (ValueError, TypeError):
+                        retry_after = 2
+                    wait = min(60, max(1, retry_after + 1))
                 if 400 <= status_code < 500 and status_code != 429:
                     print(
                         f"Discord HTTP {status_code}; private log endpoint "
                         f"rejected chunk {index + 1}"
                     )
                     break
-            except urllib.error.HTTPError as exc:
-                if exc.code == 429:
-                    try:
-                        body = json.loads(exc.read().decode("utf-8", "replace"))
-                        retry_after = float(body.get("retry_after", 2))
-                    except (ValueError, TypeError, json.JSONDecodeError):
-                        retry_after = 2
-                    wait = min(60, max(1, retry_after + 1))
-                elif 400 <= exc.code < 500:
-                    print(
-                        f"Discord HTTP {exc.code}; private log endpoint "
-                        f"rejected chunk {index + 1}"
-                    )
-                    break
                 print(
-                    f"Discord HTTP {exc.code}; retrying chunk {index + 1} "
+                    f"Discord HTTP {status_code}; retrying chunk {index + 1} "
                     f"in {wait}s ({attempt + 1}/5)"
                 )
-            except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+            except (requests.RequestException, OSError, TimeoutError, ValueError) as exc:
                 print(
                     f"Discord transport error {type(exc).__name__}; retrying "
                     f"chunk {index + 1} in {wait}s ({attempt + 1}/5)"
