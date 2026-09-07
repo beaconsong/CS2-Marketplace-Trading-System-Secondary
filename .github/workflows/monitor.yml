@@ -1,5 +1,7 @@
 name: CSFloat Hourly Monitor
 on:
+  schedule:
+    - cron: "*/15 * * * *"
   workflow_dispatch:
     inputs:
       listing_tier:
