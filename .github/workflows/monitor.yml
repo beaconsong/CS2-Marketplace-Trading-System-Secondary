@@ -1,4 +1,5 @@
-name: CSFloat Hourly Monitor
+# Bot B is manual-dispatch only until the operator explicitly enables it.
+name: CSFloat Secondary Monitor
 on:
   workflow_dispatch:
     inputs:
@@ -14,7 +15,7 @@ on:
           - cold
 
 concurrency:
-  group: csfloat-hourly-monitor-production
+  group: csfloat-secondary-monitor-production
   cancel-in-progress: false
 
 env:
